@@ -21,22 +21,23 @@ An AI agent skill that gives any agent full browser automation capabilities thro
 npx skills add MeLoveLootbox/computer-use
 ```
 
-### Manual setup
+### One-command setup
+
+**macOS / Linux:**
 ```bash
-# Clone
 git clone https://github.com/MeLoveLootbox/computer-use.git
 cd computer-use
-
-# Setup Python venv
-python -m venv .venv
-
-# Install dependencies
-.venv/bin/pip install -r servers/requirements.txt   # macOS/Linux
-.venv\Scripts\pip install -r servers/requirements.txt  # Windows
-
-# Install Chromium
-.venv/bin/playwright install chromium
+bash setup.sh
 ```
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/MeLoveLootbox/computer-use.git
+cd computer-use
+.\setup.ps1
+```
+
+This creates a `.venv`, installs all Python deps, downloads Chromium, and prints the MCP config snippet for your agent.
 
 ### Register with your agent
 
