@@ -8,6 +8,13 @@ Tools:
   - capture_state(action_name: str, result_ok: bool=True, error_msg: str="")
   - close_browser()
 
+Profile/Login Modes:
+  - Fresh Chromium (default): no logins, clean slate
+  - CU_CDP_PORT=9222: connect to YOUR Chrome (preserves all logins/cookies)
+    Launch Chrome manually with: --remote-debugging-port=9222
+  - CU_CHROME_PROFILE=path: use your Chrome profile directory
+    (Chrome must NOT be running when using this mode)
+
 Notes:
 - Uses Playwright ASYNC API (MCP host runs an asyncio loop).
 - Logs to stderr only.
@@ -48,6 +55,12 @@ DEFAULT_HEADLESS = True  # silent by default
 DEFAULT_SLOW_MO_MS = int(os.getenv("CU_SLOW_MO", "250"))  # ms between actions
 SHOW_CURSOR = os.getenv("CU_SHOW_CURSOR", "").strip().lower() in ("1", "true", "yes")
 
+# Profile / CDP connection
+CDP_PORT = os.getenv("CU_CDP_PORT", "").strip()  # e.g. "9222"
+CHROME_PROFILE = os.getenv("CU_CHROME_PROFILE", "").strip()  # user-data-dir path
+USE_CDP = bool(CDP_PORT) and CDP_PORT.isdigit()
+USE_PROFILE = bool(CHROME_PROFILE) and os.path.isdir(CHROME_PROFILE)
+
 CURSOR_OVERLAY_JS = r"""
 (() => {
   if (window.__mcpCursorInstalled) return;
@@ -81,6 +94,7 @@ _STATE: Dict[str, Any] = {
     "page": None,         # Page
     "screen_width": 1440,
     "screen_height": 900,
+    "connect_mode": "fresh",  # "fresh", "cdp", or "profile"
 }
 
 _SUPPORTED_ACTIONS = [
@@ -261,6 +275,12 @@ async def initialize_browser(
 ) -> Dict[str, Any]:
     """
     Initializes the Playwright browser, context, and page (ASYNC).
+
+    Connection modes (set via env vars BEFORE starting the agent):
+      - Default (no env vars): fresh Chromium, no logins
+      - CU_CDP_PORT=9222: connect to your existing Chrome (preserves logins/cookies)
+      - CU_CHROME_PROFILE=path: launch using your Chrome profile (Chrome must be closed)
+
     Args:
         url: initial URL
         width/height: viewport
@@ -287,16 +307,65 @@ async def initialize_browser(
         if os.getenv("CU_NO_SANDBOX", "").strip().lower() in ("1", "true", "yes"):
             launch_args["args"] = ["--no-sandbox"]
 
-        _STATE["browser"] = await _STATE["playwright"].chromium.launch(
-            headless=effective_headless,
-            slow_mo=DEFAULT_SLOW_MO_MS,
-            **launch_args
-        )
-        _STATE["context"] = await _STATE["browser"].new_context(
-            viewport={"width": _STATE["screen_width"], "height": _STATE["screen_height"]},
-            device_scale_factor=2,
-        )
-        _STATE["page"] = await _STATE["context"].new_page()
+        # ---- MODE: Connect to existing Chrome via CDP ----
+        if USE_CDP:
+            cdp_url = f"http://localhost:{CDP_PORT}"
+            log.info("Connecting to existing Chrome via CDP at %s", cdp_url)
+            try:
+                _STATE["browser"] = await _STATE["playwright"].chromium.connect_over_cdp(cdp_url)
+                contexts = _STATE["browser"].contexts
+                if contexts:
+                    _STATE["context"] = contexts[0]
+                    _STATE["page"] = contexts[0].pages[0] if contexts[0].pages else await contexts[0].new_page()
+                else:
+                    _STATE["context"] = await _STATE["browser"].new_context(
+                        viewport={"width": width, "height": height},
+                        device_scale_factor=2,
+                    )
+                    _STATE["page"] = await _STATE["context"].new_page()
+                _STATE["connect_mode"] = "cdp"
+                log.info("Connected to user's Chrome via CDP. Logins/cookies preserved.")
+            except Exception as e:
+                log.error("CDP connection failed. Is Chrome running with --remote-debugging-port=%s?", CDP_PORT)
+                log.error("Error: %s", e)
+                log.error("Launch Chrome manually: chrome.exe --remote-debugging-port=%s", CDP_PORT)
+                raise RuntimeError(
+                    f"CDP connection to localhost:{CDP_PORT} failed. "
+                    f"Launch Chrome with: chrome.exe --remote-debugging-port={CDP_PORT}"
+                ) from e
+
+        # ---- MODE: Launch Chromium with user's Chrome profile ----
+        elif USE_PROFILE:
+            if effective_headless:
+                log.warning("Profile mode forces headful (persistent context requirement).")
+                effective_headless = False
+            log.info("Launching Chromium with profile: %s", CHROME_PROFILE)
+            _STATE["context"] = await _STATE["playwright"].chromium.launch_persistent_context(
+                user_data_dir=CHROME_PROFILE,
+                headless=False,
+                slow_mo=DEFAULT_SLOW_MO_MS,
+                viewport={"width": width, "height": height},
+                device_scale_factor=2,
+                **launch_args
+            )
+            _STATE["browser"] = None  # persistent context manages its own browser
+            _STATE["page"] = _STATE["context"].pages[0] if _STATE["context"].pages else await _STATE["context"].new_page()
+            _STATE["connect_mode"] = "profile"
+            log.info("Chromium launched with profile. Logins/cookies preserved.")
+
+        # ---- MODE: Fresh Chromium (default) ----
+        else:
+            _STATE["browser"] = await _STATE["playwright"].chromium.launch(
+                headless=effective_headless,
+                slow_mo=DEFAULT_SLOW_MO_MS,
+                **launch_args
+            )
+            _STATE["context"] = await _STATE["browser"].new_context(
+                viewport={"width": _STATE["screen_width"], "height": _STATE["screen_height"]},
+                device_scale_factor=2,
+            )
+            _STATE["page"] = await _STATE["context"].new_page()
+            _STATE["connect_mode"] = "fresh"
 
         # Optional cursor overlay
         if SHOW_CURSOR:
@@ -310,8 +379,8 @@ async def initialize_browser(
         await _await_render(_STATE["page"])
 
         log.info(
-            "Browser initialized to %s at %dx%d (headless=%s, slow_mo=%dms)",
-            url, width, height, effective_headless, DEFAULT_SLOW_MO_MS
+            "Browser initialized to %s at %dx%d (mode=%s, headless=%s, slow_mo=%dms)",
+            url, width, height, _STATE["connect_mode"], effective_headless, DEFAULT_SLOW_MO_MS
         )
         return {
             "ok": True,
@@ -320,6 +389,7 @@ async def initialize_browser(
             "height": _STATE["screen_height"],
             "headless": effective_headless,
             "slow_mo_ms": DEFAULT_SLOW_MO_MS,
+            "connect_mode": _STATE["connect_mode"],
         }
     except Exception as e:
         log.error("Initialization failed: %s", e)
@@ -444,14 +514,28 @@ async def fill_selector(selector: str, text: str, press_enter: bool = False, cle
 @mcp.tool()
 async def close_browser() -> Dict[str, Any]:
     """Closes the Playwright browser and releases resources (ASYNC)."""
+    mode = _STATE.get("connect_mode", "fresh")
     try:
-        if _STATE["context"]:
-            await _STATE["context"].close()
-        if _STATE["browser"]:
-            await _STATE["browser"].close()
+        if mode == "cdp":
+            # CDP: only close our context/page, don't kill user's Chrome
+            if _STATE["context"]:
+                await _STATE["context"].close()
+            if _STATE["page"]:
+                _STATE["page"] = None
+            log.info("Disconnected from CDP browser (user's Chrome remains open).")
+        elif mode == "profile":
+            # Profile: close persistent context (browser managed internally)
+            if _STATE["context"]:
+                await _STATE["context"].close()
+        else:
+            # Fresh: close context, browser, then stop Playwright
+            if _STATE["context"]:
+                await _STATE["context"].close()
+            if _STATE["browser"]:
+                await _STATE["browser"].close()
         if _STATE["playwright"]:
             await _STATE["playwright"].stop()
-        log.info("Browser closed successfully.")
+        log.info("Browser closed successfully. (mode=%s)", mode)
         return {"ok": True}
     except Exception as e:
         log.error("Error closing browser: %s", e)
@@ -459,7 +543,7 @@ async def close_browser() -> Dict[str, Any]:
     finally:
         _STATE.update({
             "playwright": None, "browser": None, "context": None, "page": None,
-            "screen_width": 1440, "screen_height": 900,
+            "screen_width": 1440, "screen_height": 900, "connect_mode": "fresh",
         })
 
 if __name__ == "__main__":

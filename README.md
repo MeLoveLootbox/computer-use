@@ -88,6 +88,18 @@ Works with any agent that supports MCP servers via stdio transport:
 | `CU_SHOW_CURSOR` | Show cursor overlay | `false` |
 | `CU_NO_SANDBOX` | Disable sandbox (Docker) | `0` |
 | `CU_BROWSER` | chromium, firefox, webkit | `chromium` |
+| `CU_CDP_PORT` | Connect to YOUR Chrome (preserves logins) | (unset) |
+| `CU_CHROME_PROFILE` | Path to Chrome user data directory | (unset) |
+
+### Use Your Own Chrome (No More Logins)
+
+```bash
+# 1. Close Chrome, then relaunch with debugging:
+chrome.exe --remote-debugging-port=9222
+
+# 2. Set env var before starting your agent:
+export CU_CDP_PORT=9222
+```
 
 ## Based on
 

@@ -143,6 +143,8 @@ Set before starting your agent to control browser behavior:
 | `CU_NO_SANDBOX` | Disable Chromium sandbox (Docker/Codespaces) | `1` |
 | `CU_BROWSER` | Force browser: `chromium`, `firefox`, `webkit` | `chromium` |
 | `CU_DEVICE_SCALE` | Retina scaling (use 2 on macOS) | `2` |
+| `CU_CDP_PORT` | Connect to YOUR Chrome via CDP (preserves logins) | `9222` |
+| `CU_CHROME_PROFILE` | Path to Chrome user-data-dir (preserves logins) | `C:\Users\...\User Data` |
 
 Typical headful demo setup:
 ```bash
@@ -150,6 +152,46 @@ export CU_HEADFUL=1
 export CU_SLOW_MO=800
 export CU_SHOW_CURSOR=true
 ```
+
+## Using Your Own Chrome (Preserves Logins)
+
+For tasks that require authentication (Gmail, YouTube, GitHub, etc.), connect to your existing Chrome to skip login entirely.
+
+### Mode 1: CDP Connection (recommended)
+
+1. **Close all Chrome windows**
+2. **Launch Chrome with remote debugging enabled:**
+   ```
+   # Windows
+   "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+
+   # macOS
+   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+   # Linux
+   google-chrome --remote-debugging-port=9222
+   ```
+3. **Set the env var before starting your agent:**
+   ```bash
+   export CU_CDP_PORT=9222
+   ```
+4. The MCP will connect to your Chrome with all logins/cookies intact
+5. When done, `close_browser()` only disconnects — your Chrome stays open
+
+### Mode 2: Profile Directory
+
+Point directly at your Chrome user data directory:
+```bash
+# Windows
+export CU_CHROME_PROFILE="C:\Users\YOU\AppData\Local\Google\Chrome\User Data"
+
+# macOS  
+export CU_CHROME_PROFILE="$HOME/Library/Application Support/Google/Chrome"
+
+# Linux
+export CU_CHROME_PROFILE="$HOME/.config/google-chrome"
+```
+Chrome must NOT be running when using this mode.
 
 ## Proven Workflows
 
