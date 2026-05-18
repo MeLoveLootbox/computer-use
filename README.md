@@ -94,12 +94,11 @@ Works with any agent that supports MCP servers via stdio transport:
 ### Use Your Own Chrome (No More Logins)
 
 ```bash
-# 1. Close Chrome, then relaunch with debugging:
-chrome.exe --remote-debugging-port=9222
-
-# 2. Set env var before starting your agent:
+# Just set this env var before starting your agent:
 export CU_CDP_PORT=9222
 ```
+
+The MCP will automatically find your Chrome, launch it with remote debugging, and connect — preserving all your logins, cookies, and sessions. Works on Windows, macOS, and Linux.
 
 ## Based on
 

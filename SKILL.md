@@ -155,28 +155,36 @@ export CU_SHOW_CURSOR=true
 
 ## Using Your Own Chrome (Preserves Logins)
 
-For tasks that require authentication (Gmail, YouTube, GitHub, etc.), connect to your existing Chrome to skip login entirely.
+For tasks that require authentication (Gmail, YouTube, GitHub, ERP systems, etc.), connect to your existing Chrome to skip login entirely.
 
-### Mode 1: CDP Connection (recommended)
+### Auto-Launch (no setup needed)
 
-1. **Close all Chrome windows**
-2. **Launch Chrome with remote debugging enabled:**
-   ```
-   # Windows
-   "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+Just set `CU_CDP_PORT=9222` and the MCP handles everything:
 
-   # macOS
-   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+```bash
+export CU_CDP_PORT=9222
+```
 
-   # Linux
-   google-chrome --remote-debugging-port=9222
-   ```
-3. **Set the env var before starting your agent:**
-   ```bash
-   export CU_CDP_PORT=9222
-   ```
-4. The MCP will connect to your Chrome with all logins/cookies intact
-5. When done, `close_browser()` only disconnects — your Chrome stays open
+When `initialize_browser` is called, the MCP will:
+1. Check if Chrome is already running with CDP on port 9222
+2. If not, **automatically find Chrome**, launch it with CDP + your profile
+3. Wait for it to start, then connect
+4. All your logins, cookies, and sessions are preserved
+
+**Requirements for auto-launch:** Chrome must NOT already be running when the MCP starts. If Chrome is already open, close it first or launch it manually with CDP (see below).
+
+### Manual Launch (if Chrome is already running)
+
+```
+# Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Linux
+google-chrome --remote-debugging-port=9222
+```
 
 ### Mode 2: Profile Directory
 
