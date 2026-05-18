@@ -10,8 +10,8 @@ Tools:
 
 Profile/Login Modes:
   - Fresh Chromium (default): no logins, clean slate
-  - CU_CDP_PORT=9222: connect to YOUR Chrome (preserves all logins/cookies)
-    Launch Chrome manually with: --remote-debugging-port=9222
+  - CU_CDP_PORT=9222: auto-connect to YOUR Chrome (preserves all logins/cookies)
+    If Chrome isn't running with CDP, it auto-launches Chrome for you.
   - CU_CHROME_PROFILE=path: use your Chrome profile directory
     (Chrome must NOT be running when using this mode)
 
@@ -20,7 +20,7 @@ Notes:
 - Logs to stderr only.
 """
 
-import os, sys, time, logging
+import os, sys, time, logging, subprocess, socket, shutil, asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any
 from io import BytesIO
@@ -61,6 +61,112 @@ CHROME_PROFILE = os.getenv("CU_CHROME_PROFILE", "").strip()  # user-data-dir pat
 USE_CDP = bool(CDP_PORT) and CDP_PORT.isdigit()
 USE_PROFILE = bool(CHROME_PROFILE) and os.path.isdir(CHROME_PROFILE)
 
+# ---------- Chrome Auto-Launch helpers ----------
+
+def _find_chrome_exe() -> Optional[str]:
+    """Find the Chrome/Chromium executable on this system."""
+    candidates = []
+    if sys.platform == "win32":
+        candidates = [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Chromium\Application\chrome.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+        ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    # Try PATH
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome", "chrome.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+def _find_chrome_profile() -> Optional[str]:
+    """Find the default Chrome user-data directory."""
+    candidates = []
+    if sys.platform == "win32":
+        base = os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data")
+        candidates.append(base)
+    elif sys.platform == "darwin":
+        candidates.append(os.path.expanduser("~/Library/Application Support/Google/Chrome"))
+    else:
+        candidates.append(os.path.expanduser("~/.config/google-chrome"))
+    for d in candidates:
+        if os.path.isdir(d):
+            return d
+    return None
+
+async def _check_cdp_port(port: int) -> bool:
+    """Check if something is listening on the CDP port."""
+    # Try httpx first (proper HTTP check)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"http://localhost:{port}/json/version")
+            return resp.status_code == 200
+    except Exception:
+        pass
+    # Fallback: raw socket check
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        result = sock.connect_ex(("localhost", port))
+        sock.close()
+        return result == 0
+    except Exception:
+        pass
+    return False
+
+def _launch_chrome_with_cdp(port: int) -> Optional[subprocess.Popen]:
+    """Launch Chrome with remote debugging enabled, using the user's profile."""
+    chrome_exe = _find_chrome_exe()
+    if not chrome_exe:
+        log.error("Chrome executable not found. Cannot auto-launch.")
+        return None
+
+    profile_dir = _find_chrome_profile()
+    if not profile_dir:
+        log.warning("Chrome profile directory not found. Launching without profile.")
+
+    cmd = [chrome_exe, f"--remote-debugging-port={port}"]
+    if profile_dir:
+        cmd.append(f"--user-data-dir={profile_dir}")
+
+    if sys.platform == "win32":
+        cmd.append("--disable-features=TranslateUI")
+    elif sys.platform == "darwin":
+        # macOS: must use `open` or the full path; also needs --args
+        # Actually just exec-ing works on modern macOS
+        pass
+
+    log.info("Auto-launching Chrome: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detach from our process group
+        )
+        return proc
+    except Exception as e:
+        log.error("Failed to launch Chrome: %s", e)
+        return None
+
 CURSOR_OVERLAY_JS = r"""
 (() => {
   if (window.__mcpCursorInstalled) return;
@@ -95,6 +201,7 @@ _STATE: Dict[str, Any] = {
     "screen_width": 1440,
     "screen_height": 900,
     "connect_mode": "fresh",  # "fresh", "cdp", or "profile"
+    "chrome_proc": None,      # subprocess.Popen if we auto-launched Chrome
 }
 
 _SUPPORTED_ACTIONS = [
@@ -307,10 +414,35 @@ async def initialize_browser(
         if os.getenv("CU_NO_SANDBOX", "").strip().lower() in ("1", "true", "yes"):
             launch_args["args"] = ["--no-sandbox"]
 
-        # ---- MODE: Connect to existing Chrome via CDP ----
+        # ---- MODE: Connect to user's Chrome via CDP (auto-launch if needed) ----
         if USE_CDP:
             cdp_url = f"http://localhost:{CDP_PORT}"
-            log.info("Connecting to existing Chrome via CDP at %s", cdp_url)
+            port = int(CDP_PORT)
+
+            # Step 1: Try connecting to an already-running Chrome
+            log.info("Checking for existing Chrome on port %s...", port)
+            already_running = await _check_cdp_port(port)
+
+            if not already_running:
+                # Step 2: Auto-launch Chrome with CDP + user profile
+                log.info("No Chrome found on port %s. Auto-launching...", port)
+                proc = _launch_chrome_with_cdp(port)
+                if proc:
+                    _STATE["chrome_proc"] = proc
+                    # Wait for Chrome to start and CDP to become ready
+                    log.info("Waiting for Chrome to start (up to 15s)...")
+                    for _ in range(30):
+                        await asyncio.sleep(0.5)
+                        if await _check_cdp_port(port):
+                            log.info("Chrome started and CDP is ready.")
+                            break
+                    else:
+                        log.warning("Chrome launched but CDP not responding. Trying anyway...")
+                else:
+                    log.warning("Could not auto-launch Chrome. Trying manual connection...")
+
+            # Step 3: Connect via CDP
+            log.info("Connecting to Chrome via CDP at %s", cdp_url)
             try:
                 _STATE["browser"] = await _STATE["playwright"].chromium.connect_over_cdp(cdp_url)
                 contexts = _STATE["browser"].contexts
@@ -324,14 +456,14 @@ async def initialize_browser(
                     )
                     _STATE["page"] = await _STATE["context"].new_page()
                 _STATE["connect_mode"] = "cdp"
-                log.info("Connected to user's Chrome via CDP. Logins/cookies preserved.")
+                log.info("Connected to Chrome via CDP. Logins/cookies preserved.")
             except Exception as e:
-                log.error("CDP connection failed. Is Chrome running with --remote-debugging-port=%s?", CDP_PORT)
+                log.error("CDP connection failed after auto-launch attempt.")
                 log.error("Error: %s", e)
-                log.error("Launch Chrome manually: chrome.exe --remote-debugging-port=%s", CDP_PORT)
+                log.error("Try manually: chrome.exe --remote-debugging-port=%s", port)
                 raise RuntimeError(
-                    f"CDP connection to localhost:{CDP_PORT} failed. "
-                    f"Launch Chrome with: chrome.exe --remote-debugging-port={CDP_PORT}"
+                    f"CDP connection to localhost:{port} failed. "
+                    f"Ensure Chrome is running with: --remote-debugging-port={port}"
                 ) from e
 
         # ---- MODE: Launch Chromium with user's Chrome profile ----
@@ -544,6 +676,7 @@ async def close_browser() -> Dict[str, Any]:
         _STATE.update({
             "playwright": None, "browser": None, "context": None, "page": None,
             "screen_width": 1440, "screen_height": 900, "connect_mode": "fresh",
+            "chrome_proc": None,
         })
 
 if __name__ == "__main__":
