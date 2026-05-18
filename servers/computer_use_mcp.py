@@ -56,10 +56,27 @@ DEFAULT_SLOW_MO_MS = int(os.getenv("CU_SLOW_MO", "250"))  # ms between actions
 SHOW_CURSOR = os.getenv("CU_SHOW_CURSOR", "").strip().lower() in ("1", "true", "yes")
 
 # Profile / CDP connection
-CDP_PORT = os.getenv("CU_CDP_PORT", "").strip()  # e.g. "9222"
+CDP_PORT = os.getenv("CU_CDP_PORT", "").strip()  # e.g. "9222", "chrome", or "auto"
 CHROME_PROFILE = os.getenv("CU_CHROME_PROFILE", "").strip()  # user-data-dir path
-USE_CDP = bool(CDP_PORT) and CDP_PORT.isdigit()
+USE_CDP = bool(CDP_PORT) and (CDP_PORT.isdigit() or CDP_PORT.lower() in ("chrome", "auto"))
 USE_PROFILE = bool(CHROME_PROFILE) and os.path.isdir(CHROME_PROFILE)
+
+def _detect_chrome_port() -> Optional[int]:
+    """Detect CDP port from Chrome's DevToolsActivePort file (channel detection)."""
+    try:
+        profile_dir = _find_chrome_profile()
+        if not profile_dir:
+            return None
+        port_file = os.path.join(profile_dir, "DevToolsActivePort")
+        if os.path.isfile(port_file):
+            with open(port_file) as f:
+                first_line = f.readline().strip()
+                port = int(first_line)
+                if 1024 <= port <= 65535:
+                    return port
+    except Exception:
+        pass
+    return None
 
 # ---------- Chrome Auto-Launch helpers ----------
 
@@ -414,22 +431,38 @@ async def initialize_browser(
         if os.getenv("CU_NO_SANDBOX", "").strip().lower() in ("1", "true", "yes"):
             launch_args["args"] = ["--no-sandbox"]
 
-        # ---- MODE: Connect to user's Chrome via CDP (auto-launch if needed) ----
+        # ---- MODE: Connect to user's Chrome via CDP ----
         if USE_CDP:
-            cdp_url = f"http://localhost:{CDP_PORT}"
-            port = int(CDP_PORT)
+            # Resolve the port to use
+            if CDP_PORT.lower() in ("chrome", "auto"):
+                detected = _detect_chrome_port()
+                if detected:
+                    port = detected
+                    log.info("Detected Chrome CDP port from DevToolsActivePort: %s", port)
+                else:
+                    log.warning("Could not detect Chrome port. Enable 'Allow remote debugging' at chrome://inspect/#remote-debugging")
+                    if CDP_PORT.lower() == "auto":
+                        log.info("Falling back to fresh Chromium.")
+                    else:
+                        raise RuntimeError(
+                            "CU_CDP_PORT=chrome but no Chrome debugging port detected. "
+                            "Open chrome://inspect/#remote-debugging and enable 'Allow remote debugging'"
+                        )
+            else:
+                port = int(CDP_PORT)
 
-            # Step 1: Try connecting to an already-running Chrome
-            log.info("Checking for existing Chrome on port %s...", port)
+            cdp_url = f"http://localhost:{port}"
+
+            # Check if Chrome is already listening
+            log.info("Checking for Chrome on port %s...", port)
             already_running = await _check_cdp_port(port)
 
-            if not already_running:
-                # Step 2: Auto-launch Chrome with CDP + user profile
+            if not already_running and CDP_PORT.isdigit():
+                # Auto-launch only for explicit port (not chrome/auto channel mode)
                 log.info("No Chrome found on port %s. Auto-launching...", port)
                 proc = _launch_chrome_with_cdp(port)
                 if proc:
                     _STATE["chrome_proc"] = proc
-                    # Wait for Chrome to start and CDP to become ready
                     log.info("Waiting for Chrome to start (up to 15s)...")
                     for _ in range(30):
                         await asyncio.sleep(0.5)
@@ -438,33 +471,22 @@ async def initialize_browser(
                             break
                     else:
                         log.warning("Chrome launched but CDP not responding. Trying anyway...")
-                else:
-                    log.warning("Could not auto-launch Chrome. Trying manual connection...")
 
-            # Step 3: Connect via CDP
+            # Connect via CDP
             log.info("Connecting to Chrome via CDP at %s", cdp_url)
-            try:
-                _STATE["browser"] = await _STATE["playwright"].chromium.connect_over_cdp(cdp_url)
-                contexts = _STATE["browser"].contexts
-                if contexts:
-                    _STATE["context"] = contexts[0]
-                    _STATE["page"] = contexts[0].pages[0] if contexts[0].pages else await contexts[0].new_page()
-                else:
-                    _STATE["context"] = await _STATE["browser"].new_context(
-                        viewport={"width": width, "height": height},
-                        device_scale_factor=2,
-                    )
-                    _STATE["page"] = await _STATE["context"].new_page()
-                _STATE["connect_mode"] = "cdp"
-                log.info("Connected to Chrome via CDP. Logins/cookies preserved.")
-            except Exception as e:
-                log.error("CDP connection failed after auto-launch attempt.")
-                log.error("Error: %s", e)
-                log.error("Try manually: chrome.exe --remote-debugging-port=%s", port)
-                raise RuntimeError(
-                    f"CDP connection to localhost:{port} failed. "
-                    f"Ensure Chrome is running with: --remote-debugging-port={port}"
-                ) from e
+            _STATE["browser"] = await _STATE["playwright"].chromium.connect_over_cdp(cdp_url)
+            contexts = _STATE["browser"].contexts
+            if contexts:
+                _STATE["context"] = contexts[0]
+                _STATE["page"] = contexts[0].pages[0] if contexts[0].pages else await contexts[0].new_page()
+            else:
+                _STATE["context"] = await _STATE["browser"].new_context(
+                    viewport={"width": width, "height": height},
+                    device_scale_factor=2,
+                )
+                _STATE["page"] = await _STATE["context"].new_page()
+            _STATE["connect_mode"] = "cdp"
+            log.info("Connected to Chrome via CDP. Logins/cookies preserved.")
 
         # ---- MODE: Launch Chromium with user's Chrome profile ----
         elif USE_PROFILE:
